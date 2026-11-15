@@ -1,0 +1,54 @@
+# 完整可启动的演示环境：
+#   nginx     — 本地 Nginx，输出 JSON 行访问日志到共享卷
+#   collector — FastAPI + SQLite 采集/查询服务，以只读方式挂载日志目录
+#   traffic   — 持续请求生成器，制造正常与故障请求
+#
+# 轮转是“可控样例”：默认手动触发（见 README），也可设置
+# AUTO_ROTATE_INTERVAL 让 nginx 容器自动周期性轮转。
+name: nginx-log-warehouse
+
+services:
+  nginx:
+    build: ./nginx
+    environment:
+      # 留空 = 手动轮转；设为数字（如 15）= 每 15 秒自动轮转
+      AUTO_ROTATE_INTERVAL: "${AUTO_ROTATE_INTERVAL:-}"
+    volumes:
+      - nginx_json_logs:/var/log/nginx/json
+    ports:
+      - "8080:80"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  collector:
+    build: ./collector
+    environment:
+      DB_PATH: /data/warehouse.db
+      LOG_DIR: /logs
+      POLL_INTERVAL: "0.5"
+      LOG_LEVEL: INFO
+    volumes:
+      # 题目要求：采集共享只读目录中的日志
+      - nginx_json_logs:/logs:ro
+      - warehouse_data:/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      nginx:
+        condition: service_healthy
+
+  traffic:
+    build: ./traffic
+    environment:
+      TARGET: http://nginx:80
+      INTERVAL: "0.2"
+    depends_on:
+      nginx:
+        condition: service_healthy
+
+volumes:
+  nginx_json_logs:
+  warehouse_data:
