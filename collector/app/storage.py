@@ -23,12 +23,14 @@ import sqlite3
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
-SCHEMA = """
+SCHEMA_PRAGMAS = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=FULL;
 PRAGMA foreign_keys=ON;
 PRAGMA busy_timeout=5000;
+"""
 
+SCHEMA_DDL = """
 CREATE TABLE IF NOT EXISTS ingest_state (
     dev          INTEGER NOT NULL,
     inode        INTEGER NOT NULL,
@@ -74,7 +76,41 @@ CREATE TABLE IF NOT EXISTS malformed_lines (
     error       TEXT    NOT NULL,
     ingested_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
+
+-- Durable delivery cursor for the failure-analysis batch job. next_event_id
+-- is the id of the first log_events row that has never been handed out in a
+-- confirmed batch. It advances only when a batch is confirmed (see
+-- batch_claims), so a crash before confirmation never skips rows.
+CREATE TABLE IF NOT EXISTS delivery_cursor (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    next_event_id INTEGER NOT NULL,
+    updated_at    TEXT    NOT NULL
+);
+INSERT INTO delivery_cursor (id, next_event_id, updated_at)
+VALUES (1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+ON CONFLICT(id) DO NOTHING;
+
+-- One row per lease ever issued. The currently outstanding batch (if any) is
+-- the most recent row (highest batch_no). A lease expires purely on wall-clock
+-- time (lease_expires_at), so the state survives a process restart unchanged:
+-- an unconfirmed batch can be reclaimed after restart, and reclamation always
+-- issues a fresh token while superseding the previous one.
+CREATE TABLE IF NOT EXISTS batch_claims (
+    batch_no         INTEGER PRIMARY KEY AUTOINCREMENT,
+    token            TEXT    NOT NULL UNIQUE,
+    first_event_id   INTEGER NOT NULL,
+    last_event_id    INTEGER NOT NULL,
+    row_count        INTEGER NOT NULL,
+    status           TEXT    NOT NULL CHECK (status IN ('leased', 'confirmed', 'expired')),
+    leased_at        TEXT    NOT NULL,
+    lease_expires_at TEXT    NOT NULL,
+    confirmed_at     TEXT,
+    result_json      TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_batch_claims_status ON batch_claims (status);
 """
+
+SCHEMA = SCHEMA_PRAGMAS + SCHEMA_DDL
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -94,6 +130,32 @@ def connect(db_path: str) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+
+
+def ensure_schema(conn: sqlite3.Connection) -> None:
+    """Create any missing tables on an already-initialised database.
+
+    Unlike :func:`init_db` this never re-runs ``PRAGMA journal_mode`` (which
+    needs an exclusive lock), so it is safe to execute on a short-lived
+    connection while the ingestor or another claim transaction is writing.
+    ``CREATE TABLE IF NOT EXISTS`` only takes the ordinary write lock and
+    honours ``busy_timeout``.
+    """
+    conn.executescript(SCHEMA_DDL)
+
+
+def open_connection(db_path: str) -> sqlite3.Connection:
+    """Open a short-lived, autocommit connection for one delivery transaction.
+
+    Claim/confirm use their own connection (rather than the shared read
+    connection) so that two concurrent claim requests serialise on SQLite's
+    write lock instead of racing on a single connection object. Every
+    transaction is ``BEGIN IMMEDIATE`` (see :func:`transaction`), which means
+    two instances can never carve different batches out of the same cursor.
+    """
+    conn = connect(db_path)
+    ensure_schema(conn)
+    return conn
 
 
 @contextmanager

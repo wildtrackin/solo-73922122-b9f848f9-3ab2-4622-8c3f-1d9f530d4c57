@@ -9,6 +9,12 @@ GET  /events                 paginated events, filter by path / status /
                              status range / source code
 GET  /events/{event_id}      single event with the raw JSON line
 GET  /malformed              quarantined lines that failed JSON parsing
+
+Failure-analysis batch delivery (lease-based, restart-safe)
+-----------------------------------------------------------
+POST /batches/claim          claim/re-claim up to 100 committed rows
+POST /batches/{token}/confirm  confirm a batch; advances the durable cursor
+GET  /batches/state          delivery cursor + outstanding lease (read-only)
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ from typing import Optional
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import storage
+from . import delivery, storage
 from .ingest import CollectorLoop, poll_once
 
 logging.basicConfig(
@@ -34,6 +40,9 @@ log = logging.getLogger("collector.api")
 DB_PATH = os.getenv("DB_PATH", "/data/warehouse.db")
 LOG_DIR = os.getenv("LOG_DIR", "/logs")
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "0.5"))
+# Validity window of a claim token. On expiry the same batch may be reclaimed
+# with a new token; the old token can no longer confirm it.
+BATCH_LEASE_SECONDS = float(os.getenv("BATCH_LEASE_SECONDS", "30"))
 
 
 class Health(BaseModel):
@@ -89,6 +98,73 @@ class EventPage(BaseModel):
     items: list[Event]
 
 
+class BatchItem(BaseModel):
+    event_id: int = Field(..., description="入仓行 id（log_events.id，全局入仓顺序）")
+    ts: Optional[str] = Field(None, description="请求时间（日志中的 time 字段）")
+    path: Optional[str] = Field(None, description="请求路径（去掉 query string）")
+    status: Optional[int] = Field(None, description="HTTP 状态码")
+    source_code: str = Field(..., description="来源文件身份：文件名/归档名")
+    dev: int = Field(..., description="来源文件所在设备号（st_dev）")
+    inode: int = Field(..., description="来源文件 inode（st_ino）")
+    byte_offset: int = Field(..., description="该行在来源文件中的起始字节位置")
+
+
+class BatchClaimResponse(BaseModel):
+    batch_no: Optional[int] = Field(
+        None, description="批次号；无新数据时为 null")
+    token: Optional[str] = Field(
+        None, description="领取令牌；确认时原样回传。无新数据时为 null")
+    leased_at: str = Field(..., description="本次领取（发令牌）的 UTC 时间")
+    lease_expires_at: Optional[str] = Field(
+        None, description="租约到期 UTC 时间；到期后本批可被重新领取")
+    lease_seconds: float = Field(..., description="租约时长（秒）")
+    reclaimed: bool = Field(
+        ..., description="是否为租约到期后的重新领取（同一批、新令牌）")
+    row_count: int = Field(..., description="本批行数，最多 100")
+    first_event_id: Optional[int] = Field(
+        None, description="本批首行 event_id；无新数据时为 null")
+    last_event_id: Optional[int] = Field(
+        None, description="本批末行 event_id；无新数据时为 null")
+    next_event_id: int = Field(
+        ..., description="确认本批后持久游标将指向的 event_id")
+    items: list[BatchItem] = Field(
+        ..., description="按入仓顺序排列的请求行；仅含已提交事务中的行")
+
+
+class BatchConfirmResponse(BaseModel):
+    batch_no: int
+    token: str
+    status: str = Field(..., description="固定为 confirmed")
+    confirmed_at: str
+    row_count: int
+    first_event_id: int
+    last_event_id: int
+    next_event_id: int = Field(
+        ..., description="已推进后的持久游标（下一批首行 event_id）")
+
+
+class OutstandingClaim(BaseModel):
+    batch_no: int
+    token: str
+    first_event_id: int
+    last_event_id: int
+    row_count: int
+    leased_at: str
+    lease_expires_at: str
+
+
+class BatchState(BaseModel):
+    next_event_id: int = Field(..., description="持久游标：下一未确认行的 event_id")
+    total_events: int = Field(..., description="入仓总行数")
+    unclaimed_events: int = Field(..., description="游标之后尚未领取的行数")
+    outstanding_claim: Optional[OutstandingClaim] = Field(
+        None, description="当前未确认的在租批次；没有则为 null")
+
+
+class BatchError(BaseModel):
+    detail: dict
+
+
 state: dict = {}
 
 
@@ -123,10 +199,26 @@ app = FastAPI(
     title="Nginx 访问日志入仓 API",
     description=(
         "持续采集共享只读目录中的 JSON 行 Nginx 日志，按 (设备, inode) "
-        "识别文件、行与续采偏移同事务提交，支持按路径与状态码分页查询故障请求。"
+        "识别文件、行与续采偏移同事务提交，支持按路径与状态码分页查询故障请求。\n\n"
+        "## 故障分析作业批次领取/确认\n"
+        "两个作业实例通过 `/batches/claim` 按入仓顺序每次领取最多 100 行"
+        "（仅已提交事务的行），拿到不透明令牌与租约；处理完成后用同一令牌调用 "
+        "`/batches/{token}/confirm`，确认成功才推进持久游标。\n\n"
+        "- 租约内重复领取：返回**同一批、同一令牌**，两个实例并发领取不会拆批。\n"
+        "- 租约到期：同批可被重新领取但**更换令牌**，旧令牌确认会被拒绝（409）。\n"
+        "- 同令牌重复确认：幂等，返回**首次确认的原结果**。\n"
+        "- 所有租约/游标状态持久化在 SQLite 中，服务重启后未确认批仍可重领。\n"
+        "- 新入仓的行只进入后续批次，响应绝不会包含未提交的行。"
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
+    openapi_tags=[
+        {"name": "meta", "description": "存活与运行状态"},
+        {"name": "ingest", "description": "持续采集控制与进度"},
+        {"name": "query", "description": "原始采集查询（保留原有分页/过滤接口）"},
+        {"name": "batch-delivery",
+         "description": "故障分析作业的批次领取与确认（租约 + 持久游标）"},
+    ],
 )
 
 
@@ -244,3 +336,88 @@ def list_malformed(limit: int = Query(100, ge=1, le=1000),
     ).fetchall()
     return {"total": total, "limit": limit, "offset": offset,
             "items": [dict(r) for r in rows]}
+
+
+# ---------------------------------------------------------------------------
+# Failure-analysis batch delivery
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/batches/claim",
+    response_model=BatchClaimResponse,
+    tags=["batch-delivery"],
+    summary="领取（或重复领取）下一个批次，最多 100 行",
+    responses={
+        409: {"description": "持久游标与在租批次不一致（不应发生的保护性错误）",
+              "model": BatchError},
+    },
+)
+def claim_batch():
+    """按入仓顺序（`log_events.id` 升序）领取最多 100 行已提交请求。
+
+    典型流程（两个作业实例都适用）：
+
+    1. `POST /batches/claim` 取得 `token`、`lease_expires_at` 与 `items`。
+    2. 在租约到期前处理这批故障请求。
+    3. `POST /batches/{token}/confirm` 确认；确认成功后持久游标才推进。
+
+    语义保证：
+
+    * **租约未到期重复领取**：返回完全相同的批次与令牌（`reclaimed=false`），
+      因此两个实例并发领取不会被分到不同批次。
+    * **租约到期后领取**：同一 id 区间被重新领取，`reclaimed=true` 且令牌换新；
+      旧令牌立即失效，不能再确认。
+    * **暂无可领取行**：返回 `row_count=0`、`token=null`、空 `items`，
+      不建立租约；新入仓并提交的行留待后续批次。
+    * 每行只包含已提交事务的数据，并带来源文件身份
+      （`source_code`/`dev`/`inode`）与字节位置 `byte_offset`。
+    """
+    try:
+        return delivery.claim_batch(
+            DB_PATH, lease_seconds=BATCH_LEASE_SECONDS
+        )
+    except delivery.DeliveryError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        )
+
+
+@app.post(
+    "/batches/{token}/confirm",
+    response_model=BatchConfirmResponse,
+    tags=["batch-delivery"],
+    summary="用有效令牌确认批次，推进持久游标",
+    responses={
+        404: {"description": "令牌不存在（从未签发）", "model": BatchError},
+        409: {"description": "令牌已失效：租约到期被新令牌取代，或已过期",
+              "model": BatchError},
+    },
+)
+def confirm_batch(token: str):
+    """确认一个已领取的批次。
+
+    * 令牌有效：游标在同一事务中推进到 `last_event_id + 1`，返回确认结果。
+    * **同一令牌重复确认**：幂等，返回首次确认时的原始结果（含原
+      `confirmed_at`），游标不会重复推进。
+    * 旧令牌（租约到期后已重新领取）：返回 409，游标保持不动。
+    * 未知令牌：返回 404。
+    """
+    try:
+        return delivery.confirm_batch(DB_PATH, token)
+    except delivery.DeliveryError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "message": exc.message},
+        )
+
+
+@app.get(
+    "/batches/state",
+    response_model=BatchState,
+    tags=["batch-delivery"],
+    summary="持久游标与当前在租批次（只读观测）",
+)
+def batch_state():
+    """查看交付进度：持久游标位置、尚未领取的行数、当前未确认的在租批次。"""
+    return delivery.delivery_state(DB_PATH)

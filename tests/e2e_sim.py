@@ -195,6 +195,91 @@ def main():
                   {"access.log", "access.log.arc1.log"}
                   and all(f["complete"] for f in prog["files"]),
                   str(prog["files"]))
+
+        print("[F] 批次领取/确认：租约语义、重启重领、游标推进")
+        # 44 committed rows exist at this point.
+        _, st0 = get("/batches/state")
+        check("delivery cursor starts at 1", st0["next_event_id"] == 1)
+        _, claim1 = post("/batches/claim")
+        check("first claim returns up to 100 rows (44 available)",
+              claim1["row_count"] == 44 and len(claim1["items"]) == 44
+              and claim1["first_event_id"] == 1
+              and claim1["last_event_id"] == 44, str(claim1["row_count"]))
+        item0 = claim1["items"][0]
+        check("items carry request fields and source identity/byte offset",
+              all(k in item0 for k in
+                  ("ts", "path", "status", "source_code", "dev",
+                   "inode", "byte_offset")), str(item0))
+        _, claim1b = post("/batches/claim")
+        check("repeat claim returns the same token and batch",
+              claim1b["token"] == claim1["token"]
+              and claim1b["batch_no"] == claim1["batch_no"]
+              and claim1b["reclaimed"] is False)
+
+        # Simulate an analysis-instance crash while the batch is unconfirmed:
+        # restart the service, then prove the batch is still reclaimable with
+        # the same token inside its lease.
+        srv2.should_exit = True
+        t2.join(timeout=10)
+        time.sleep(0.3)
+        srv3, t3 = start_server()
+        try:
+            _, claim_after_restart = post("/batches/claim")
+            check("unconfirmed batch survives restart with the same token",
+                  claim_after_restart["token"] == claim1["token"]
+                  and claim_after_restart["first_event_id"] == 1
+                  and claim_after_restart["last_event_id"] == 44)
+            _, st1 = get("/batches/state")
+            check("outstanding lease visible after restart",
+                  st1["outstanding_claim"] is not None
+                  and st1["outstanding_claim"]["token"] == claim1["token"])
+
+            # Unknown token must be rejected, then a valid confirm advances
+            # the durable cursor.
+            req = urllib.request.Request(
+                BASE_URL + "/batches/bogus-token/confirm", method="POST")
+            try:
+                urllib.request.urlopen(req, timeout=5)
+                code = 200
+            except urllib.error.HTTPError as e:
+                code = e.code
+            check("unknown confirm token -> 404", code == 404, str(code))
+
+            _, conf = post(f"/batches/{claim1['token']}/confirm")
+            check("confirm advances cursor past the batch",
+                  conf["status"] == "confirmed"
+                  and conf["next_event_id"] == 45
+                  and conf["row_count"] == 44)
+            _, conf2 = post(f"/batches/{claim1['token']}/confirm")
+            check("repeat confirm is idempotent (same result)", conf2 == conf)
+            _, st2 = get("/batches/state")
+            check("cursor durable at 45, no outstanding lease",
+                  st2["next_event_id"] == 45
+                  and st2["outstanding_claim"] is None
+                  and st2["unclaimed_events"] == 0)
+
+            # Newly ingested rows form the next batch; earlier batch stays
+            # untouched while leased.
+            with open(cur, "a") as fh:
+                for i in range(3):
+                    fh.write(jline("/after/confirm", 500))
+            post("/ingest/poll-now")
+            _, empty_before = post("/batches/claim")
+            # There are now 3 new rows (ids 45..47).
+            check("new rows delivered in a subsequent batch",
+                  empty_before["row_count"] == 3
+                  and empty_before["first_event_id"] == 45
+                  and empty_before["last_event_id"] == 47)
+            _, conf3 = post(f"/batches/{empty_before['token']}/confirm")
+            check("second batch confirmed, cursor -> 48",
+                  conf3["next_event_id"] == 48)
+            _, drained = post("/batches/claim")
+            check("no rows left: empty claim without a token",
+                  drained["row_count"] == 0 and drained["token"] is None
+                  and drained["items"] == [])
+        finally:
+            srv3.should_exit = True
+            t3.join(timeout=10)
     finally:
         srv2.should_exit = True
         t2.join(timeout=10)

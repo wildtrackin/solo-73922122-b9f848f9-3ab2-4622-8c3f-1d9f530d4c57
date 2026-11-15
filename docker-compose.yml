@@ -29,6 +29,8 @@ services:
       DB_PATH: /data/warehouse.db
       LOG_DIR: /logs
       POLL_INTERVAL: "0.5"
+      # 批次领取令牌的租约秒数：到期后同批可换令牌重新领取，旧令牌失效
+      BATCH_LEASE_SECONDS: "${BATCH_LEASE_SECONDS:-30}"
       LOG_LEVEL: INFO
     volumes:
       # 题目要求：采集共享只读目录中的日志
